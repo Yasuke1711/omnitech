@@ -28,17 +28,65 @@ try {
 }
 
 // --- Helper: Text to Speech ---
-const speak = (text) => {
-  if (!window.speechSynthesis) return;
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
-  const voices = window.speechSynthesis.getVoices();
-  const preferredVoice = voices.find(v => v.name.includes("Google US English")) || voices[0];
-  if (preferredVoice) utterance.voice = preferredVoice;
-  utterance.rate = 1.1;
-  utterance.pitch = 0.9;
-  window.speechSynthesis.speak(utterance);
+let OMNI_VOICE = null;
+
+const pickBestVoice = () => {
+  const voices = window.speechSynthesis?.getVoices?.() || [];
+  if (!voices.length) return null;
+
+  const preferred = [
+    /Google (US )?English/i,
+    /Microsoft (Aria|Jenny|Guy|Ryan|Zira|David)/i,
+    /Natural/i,
+    /Neural/i,
+    /English/i,
+  ];
+
+  const englishVoices = voices.filter(
+    v => /^en(-|_)?/i.test(v.lang) || /english/i.test(v.name)
+  );
+
+  const pool = englishVoices.length ? englishVoices : voices;
+
+  for (const rx of preferred) {
+    const match = pool.find(v => rx.test(v.name));
+    if (match) return match;
+  }
+
+  return pool[0] || null;
 };
+
+const ensureVoiceReady = () => {
+  if (!window.speechSynthesis) return;
+  if (OMNI_VOICE) return;
+
+  OMNI_VOICE = pickBestVoice();
+
+  window.speechSynthesis.onvoiceschanged = () => {
+    OMNI_VOICE = pickBestVoice();
+  };
+};
+
+const speak = (text, opts = {}) => {
+  if (!window.speechSynthesis || !text) return;
+
+  ensureVoiceReady();
+  window.speechSynthesis.cancel();
+
+  const u = new SpeechSynthesisUtterance(
+    String(text).replace(/\.\s+/g, ". … ")
+  );
+
+  if (OMNI_VOICE) u.voice = OMNI_VOICE;
+
+  // OmniTech voice tuning
+  u.rate = opts.rate ?? 1.02;   // calm, natural
+  u.pitch = opts.pitch ?? 0.88; // slightly deeper
+  u.volume = opts.volume ?? 1.0;
+
+  window.speechSynthesis.speak(u);
+};
+
 
 // --- Main Application Component ---
 export default function App() {
@@ -60,6 +108,12 @@ export default function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const streamRef = useRef(null);
+
+  useEffect(() => {
+    if (!window.speechSynthesis) return;
+    ensureVoiceReady();
+    window.speechSynthesis.getVoices();
+  }, []);
 
   // --- Auth & Init ---
   useEffect(() => {
