@@ -5,28 +5,24 @@ import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken }
 import { getFirestore, collection, addDoc, serverTimestamp } from "firebase/firestore";
 
 // --- Configuration & Constants ---
-// NOTE FOR LOCAL DEV: When copying to VS Code, use "const API_KEY = import.meta.env.VITE_GEMINI_API_KEY;"
-// For this preview, we leave it empty or use internal handling.
-const API_KEY = ""; 
+const API_KEY = import.meta.env.VITE_GEMINI_API_KEY; 
 const GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025";
 
 // --- Firebase Setup ---
-// NOTE FOR LOCAL DEV: Replace the line below with:
-// const firebaseConfig = { 
-//   apiKey: import.meta.env.VITE_FIREBASE_API_KEY, 
-//   authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN, 
-//   ... 
-// };
-const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = {
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+};
 
 let auth, db;
 try {
-  if (Object.keys(firebaseConfig).length > 0) {
-    const app = initializeApp(firebaseConfig);
-    auth = getAuth(app);
-    db = getFirestore(app);
-  }
+  const app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db = getFirestore(app);
 } catch (e) {
   console.error("Firebase init error:", e);
 }
@@ -222,7 +218,8 @@ export default function App() {
 
     if (user && db) {
       try {
-        addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'safety_events'), {
+        addDoc(collection(db, 'artifacts', 'omnitech', 'users', user.uid, 'safety_events')
+                , {
           timestamp: serverTimestamp(),
           mode: mode,
           ...result
