@@ -5,22 +5,20 @@ import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken }
 import { getFirestore, collection, addDoc, serverTimestamp } from "firebase/firestore";
 
 // --- Configuration & Constants ---
-const API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
+// NOTE FOR LOCAL DEV: When copying to VS Code, use "const API_KEY = import.meta.env.VITE_GEMINI_API_KEY;"
+// For this preview, we leave it empty or use internal handling.
+const API_KEY = ""; 
 const GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025";
 
 // --- Firebase Setup ---
-const firebaseConfig = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
-  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
-  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
-  appId: import.meta.env.VITE_FIREBASE_APP_ID,
-};
-
-// If you still want appId for the Firestore path, keep this:
-const appId = "default-app-id";
-
+// NOTE FOR LOCAL DEV: Replace the line below with:
+// const firebaseConfig = { 
+//   apiKey: import.meta.env.VITE_FIREBASE_API_KEY, 
+//   authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN, 
+//   ... 
+// };
+const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 
 let auth, db;
 try {
@@ -71,7 +69,6 @@ export default function App() {
   useEffect(() => {
     if (!auth) return;
     const initAuth = async () => {
-      // Handle hackathon custom tokens if present
       if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
         await signInWithCustomToken(auth, __initial_auth_token);
       } else {
@@ -101,14 +98,6 @@ export default function App() {
     }
   };
 
-  const stopCamera = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      setIsStreamActive(false);
-    }
-  };
-
-  // --- Gemini Integration ---
   const captureFrame = () => {
     if (!videoRef.current || !canvasRef.current) return null;
     const canvas = canvasRef.current;
@@ -122,7 +111,7 @@ export default function App() {
     return canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
   };
 
-  // Main Multimodal Handler
+  // --- Gemini Integration ---
   const callOmniTech = async (mode = "safety_check", userContext = "") => {
     setAnalyzing(true);
     const imageBase64 = captureFrame();
@@ -150,23 +139,11 @@ export default function App() {
     `;
 
     if (mode === "safety_check") {
-      systemInstruction += `
-        TASK: Scan for immediate hazards. 
-        - If unsure or view blocked -> UNCERTAIN.
-        - If safe -> SAFE.
-        - If hazardous -> DANGER.
-      `;
+      systemInstruction += `TASK: Scan for immediate hazards. If unsure/blocked -> UNCERTAIN. If safe -> SAFE. If hazardous -> DANGER.`;
     } else if (mode === "diagnosis") {
-      systemInstruction += `
-        TASK: Diagnose the failure. 
-        CRITICAL: If you see a safety hazard during diagnosis, immediately switch status to DANGER and issue a stop command.
-      `;
+      systemInstruction += `TASK: Diagnose failure. CRITICAL: If safety hazard seen -> DANGER and stop.`;
     } else if (mode === "repair_guide") {
-      systemInstruction += `
-        TASK: Provide a clear, numbered step-by-step repair guide for the equipment seen in the image. 
-        Assume the user has already confirmed safety. 
-        Populate the 'repair_steps' array in the JSON.
-      `;
+      systemInstruction += `TASK: Provide step-by-step repair guide. Assume safety confirmed. Populate 'repair_steps'.`;
     }
 
     try {
@@ -261,10 +238,10 @@ export default function App() {
   // --- Render Helpers ---
   const getStatusColor = () => {
     switch(systemState) {
-      case 'DANGER': return 'border-red-500 shadow-[0_0_50px_rgba(239,68,68,0.5)]';
-      case 'SAFE': return 'border-emerald-500 shadow-[0_0_50px_rgba(16,185,129,0.3)]';
-      case 'UNCERTAIN': return 'border-amber-500 shadow-[0_0_50px_rgba(245,158,11,0.3)]';
-      default: return 'border-slate-700';
+      case 'DANGER': return 'border-red-500 shadow-[0_0_80px_rgba(239,68,68,0.6)]';
+      case 'SAFE': return 'border-emerald-500 shadow-[0_0_80px_rgba(16,185,129,0.4)]';
+      case 'UNCERTAIN': return 'border-amber-500 shadow-[0_0_80px_rgba(245,158,11,0.4)]';
+      default: return 'border-slate-800';
     }
   };
 
@@ -277,29 +254,49 @@ export default function App() {
     }
   };
 
-  // Updated Button Styles
-  // Removed w-full, added padding-x for a pill shape
+  // Styles
   const btnPrimary = "inline-flex items-center justify-center gap-2 rounded-full font-bold tracking-widest uppercase transition-all duration-200 ease-out select-none shadow-[0_10px_30px_-10px_rgba(34,211,238,0.5)] bg-cyan-600 hover:bg-cyan-500 text-white px-10 py-4";
   const sheen = "relative overflow-hidden before:content-[''] before:absolute before:inset-0 before:opacity-0 hover:before:opacity-100 before:transition-opacity before:bg-[radial-gradient(circle_at_50%_0%,rgba(255,255,255,0.2),transparent_60%)]";
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 font-sans overflow-hidden flex flex-col relative selection:bg-cyan-500/30">
       
+      {/* --- BACKGROUND EFFECTS (New!) --- */}
+      <div className="fixed inset-0 z-0 pointer-events-none overflow-hidden">
+        {/* 1. Cyberpunk Grid */}
+        <div className="absolute inset-0 bg-[linear-gradient(to_right,#1f2937_1px,transparent_1px),linear-gradient(to_bottom,#1f2937_1px,transparent_1px)] bg-[size:40px_40px] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_0%,#000_70%,transparent_100%)] opacity-20" />
+        
+        {/* 2. Energy Surges (Pulsing Orbs) */}
+        <div className={`absolute top-[-10%] left-[-10%] w-[500px] h-[500px] rounded-full blur-[100px] mix-blend-screen animate-pulse opacity-20 transition-colors duration-1000 ${
+          systemState === 'DANGER' ? 'bg-red-600' : 'bg-cyan-600'
+        }`} />
+        <div className={`absolute bottom-[-10%] right-[-10%] w-[500px] h-[500px] rounded-full blur-[100px] mix-blend-screen animate-pulse opacity-20 delay-1000 transition-colors duration-1000 ${
+          systemState === 'DANGER' ? 'bg-orange-600' : 'bg-emerald-600'
+        }`} />
+
+        {/* 3. The Scanner Beam (Moves down the screen) */}
+        {isStreamActive && !analyzing && (
+           <div className="absolute inset-0 z-0 pointer-events-none">
+             <div className="w-full h-[2px] bg-gradient-to-r from-transparent via-cyan-400/50 to-transparent absolute top-0 animate-[scan_3s_linear_infinite]" />
+           </div>
+        )}
+      </div>
+
       {/* --- HUD Overlay --- */}
       <div className={`absolute inset-0 pointer-events-none border-[12px] transition-all duration-500 z-20 ${getStatusColor()} opacity-80`} />
       
       {/* --- Header --- */}
       <div className="absolute top-0 left-0 right-0 z-30 p-4 flex justify-between items-start bg-gradient-to-b from-black/80 to-transparent">
         <div>
-          <h1 className="text-2xl font-bold tracking-widest text-cyan-400 flex items-center gap-2">
+          <h1 className="text-2xl font-bold tracking-widest text-cyan-400 flex items-center gap-2 drop-shadow-[0_0_10px_rgba(34,211,238,0.8)]">
             <Activity className="w-6 h-6 animate-pulse" /> OMNI<span className="text-white">TECH</span>
           </h1>
           <p className="text-xs text-slate-400 font-mono mt-1">UNIT: {user ? user.uid.slice(0,6) : 'OFFLINE'} // V.3.2.0</p>
         </div>
-        <div className={`px-4 py-2 rounded-sm border backdrop-blur-md font-mono font-bold tracking-widest ${
-          systemState === 'DANGER' ? 'bg-red-900/50 border-red-500 text-red-100 animate-pulse' :
-          systemState === 'SAFE' ? 'bg-emerald-900/50 border-emerald-500 text-emerald-100' :
-          systemState === 'UNCERTAIN' ? 'bg-amber-900/50 border-amber-500 text-amber-100' :
+        <div className={`px-4 py-2 rounded-sm border backdrop-blur-md font-mono font-bold tracking-widest shadow-lg ${
+          systemState === 'DANGER' ? 'bg-red-900/50 border-red-500 text-red-100 animate-pulse shadow-red-500/20' :
+          systemState === 'SAFE' ? 'bg-emerald-900/50 border-emerald-500 text-emerald-100 shadow-emerald-500/20' :
+          systemState === 'UNCERTAIN' ? 'bg-amber-900/50 border-amber-500 text-amber-100 shadow-amber-500/20' :
           'bg-slate-900/50 border-slate-700 text-slate-400'
         }`}>
           {getStatusText()}
@@ -307,10 +304,9 @@ export default function App() {
       </div>
 
       {/* --- Main Viewport --- */}
-      <div className="flex-1 relative bg-black flex items-center justify-center overflow-hidden">
+      <div className="flex-1 relative bg-black flex items-center justify-center overflow-hidden z-10">
         {!isStreamActive && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center z-10 bg-slate-900/90">
-            {/* Added relative container for button to prevent layout shifting */}
+          <div className="absolute inset-0 flex flex-col items-center justify-center z-10 bg-slate-900/80 backdrop-blur-sm">
             <div className="relative">
               <button onClick={startCamera} className={btnPrimary + " " + sheen}>
                 <Camera className="w-6 h-6" /> Initialize Optics
@@ -362,11 +358,11 @@ export default function App() {
       </div>
 
       {/* --- Control Deck --- */}
-      <div className="z-30 bg-slate-950 border-t border-slate-800 p-4 pb-8">
+      <div className="z-30 bg-slate-950 border-t border-slate-800 p-4 pb-8 shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
         <div className="max-w-4xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-4">
           
           {/* Logs */}
-          <div className="hidden md:flex flex-col h-40 bg-slate-900/50 p-2 rounded border border-slate-800">
+          <div className="hidden md:flex flex-col h-40 bg-slate-900/50 p-2 rounded border border-slate-800 backdrop-blur-md">
             <div className="flex justify-between items-center mb-2 pb-2 border-b border-slate-800">
               <span className="text-xs font-mono text-slate-500">SESSION LOGS</span>
               <button onClick={generateFieldReport} disabled={logs.length < 2 || generatingReport} className="text-xs bg-slate-800 hover:bg-slate-700 text-cyan-400 px-2 py-1 rounded flex items-center gap-1 transition-colors disabled:opacity-50">
@@ -383,60 +379,37 @@ export default function App() {
           {/* Controls */}
           <div className="flex flex-col gap-3">
             
-            {/* GOOGLE PLAY STYLE SLIDING CONTROLS (FIXED ANIMATION) */}
-            <div className="relative flex w-full h-16 bg-slate-900/80 rounded-full p-1 ring-1 ring-white/10 backdrop-blur-md overflow-hidden">
+            {/* GOOGLE PLAY STYLE SLIDING CONTROLS */}
+            <div className="relative flex w-full h-16 bg-slate-900/80 rounded-full p-1 ring-1 ring-white/10 backdrop-blur-md overflow-hidden shadow-inner shadow-black/50">
               
               {/* Sliding Background */}
-<div
-  className={
-    "absolute top-1 bottom-1 left-1 right-1 rounded-full " +
-    "bg-transparent pointer-events-none"
-  }
->
-  <div
-    className={
-      "h-full w-1/2 rounded-full bg-cyan-600 shadow-lg shadow-cyan-900/50 " +
-      "transition-transform duration-400 ease-out will-change-transform " +
-      (activeTab === "safety" ? "translate-x-0" : "translate-x-full")
-    }
-  />
-</div>
+              <div 
+                className={`absolute top-1 bottom-1 left-1 w-[calc(50%-4px)] rounded-full transition-transform duration-300 ease-out z-0 shadow-lg shadow-cyan-900/50 bg-cyan-600 ${
+                  activeTab === 'safety' ? 'translate-x-0' : 'translate-x-full'
+                }`} 
+              />
 
               {/* Safety Button */}
               <button 
                 onClick={() => { setActiveTab('safety'); callOmniTech("safety_check"); }}
                 disabled={!isStreamActive || analyzing}
-                className={`flex-1 relative z-10 flex items-center justify-center gap-2 font-bold tracking-wide 
-                  transition-all duration-200 ease-out active:scale-[0.98] 
-                  ${activeTab === 'safety' ? 'text-white' : 'text-slate-400 hover:text-slate-200'}`}
-                  
+                className={`flex-1 relative z-10 flex items-center justify-center gap-2 font-bold tracking-wide transition-colors duration-200 ${activeTab === 'safety' ? 'text-white' : 'text-slate-400 hover:text-slate-200'}`}
               >
                 <ShieldCheck className="w-5 h-5" /> SAFETY
               </button>
 
               {/* Diagnose Button */}
-<button
-  onClick={() => {
-    setActiveTab("diagnose");
-    callOmniTech("diagnosis");
-  }}
-  disabled={!isStreamActive || analyzing || systemState === "DANGER" || systemState === "UNCERTAIN"}
-  className={
-    "flex-1 relative z-10 flex items-center justify-center gap-2 font-bold tracking-wide " +
-    "transition-all duration-200 ease-out active:scale-[0.98] " +
-    ((systemState === "DANGER" || systemState === "UNCERTAIN" || !isStreamActive || analyzing)
-      ? "opacity-30 cursor-not-allowed text-slate-400"
-      : (activeTab === "diagnose" ? "text-white" : "text-slate-400 hover:text-slate-200"))
-  }
->
-  {systemState === "DANGER" ? (
-    <ShieldAlert className="w-5 h-5 text-red-400" />
-  ) : (
-    <Zap className="w-5 h-5" />
-  )}
-  DIAGNOSE
-</button>
-
+              <button 
+                onClick={() => { setActiveTab('diagnose'); callOmniTech("diagnosis"); }}
+                disabled={!isStreamActive || analyzing || systemState === 'DANGER' || systemState === 'UNCERTAIN'}
+                className={`flex-1 relative z-10 flex items-center justify-center gap-2 font-bold tracking-wide transition-colors duration-200 ${
+                  systemState === 'DANGER' || systemState === 'UNCERTAIN' ? 'opacity-30 cursor-not-allowed' :
+                  activeTab === 'diagnose' ? 'text-white' : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {systemState === 'DANGER' ? <ShieldAlert className="w-5 h-5 text-red-400" /> : <Zap className="w-5 h-5" />}
+                DIAGNOSE
+              </button>
             </div>
 
             {/* Input */}
@@ -444,7 +417,7 @@ export default function App() {
               <input 
                 type="text" 
                 placeholder="Describe issue (or use voice)..." 
-                className="w-full bg-slate-900 border border-slate-700 rounded px-4 py-3 text-sm focus:outline-none focus:border-cyan-500 transition-colors"
+                className="w-full bg-slate-900 border border-slate-700 rounded px-4 py-3 text-sm focus:outline-none focus:border-cyan-500 transition-colors shadow-inner"
                 onKeyDown={(e) => { if (e.key === 'Enter') { callOmniTech("diagnosis", e.target.value); e.target.value = ''; } }}
               />
               <Mic className="absolute right-3 top-3 w-5 h-5 text-slate-500 hover:text-cyan-400 cursor-pointer" />
@@ -464,7 +437,7 @@ export default function App() {
       {/* Alert Banners */}
       {systemState === 'DANGER' && (
         <div className="absolute bottom-32 left-0 right-0 flex justify-center pointer-events-none z-50">
-          <div className="bg-red-600/90 text-white px-6 py-3 rounded-md font-bold text-sm shadow-lg flex items-center gap-3 max-w-md text-center animate-bounce">
+          <div className="bg-red-600/90 text-white px-6 py-3 rounded-md font-bold text-sm shadow-[0_0_30px_rgba(220,38,38,0.5)] flex items-center gap-3 max-w-md text-center animate-bounce">
             <ShieldAlert className="w-6 h-6 flex-shrink-0" /> 
             <span>PROTOCOL LOCKED: {currentAnalysis?.action_required || "Resolve hazard before proceeding."}</span>
           </div>
@@ -472,7 +445,7 @@ export default function App() {
       )}
       {systemState === 'UNCERTAIN' && (
         <div className="absolute bottom-32 left-0 right-0 flex justify-center pointer-events-none z-50">
-          <div className="bg-amber-600/90 text-white px-6 py-3 rounded-md font-bold text-sm shadow-lg flex items-center gap-3 max-w-md text-center">
+          <div className="bg-amber-600/90 text-white px-6 py-3 rounded-md font-bold text-sm shadow-[0_0_30px_rgba(217,119,6,0.5)] flex items-center gap-3 max-w-md text-center">
              <ScanEye className="w-6 h-6 flex-shrink-0" />
             <span>VISUALS UNCLEAR: {currentAnalysis?.action_required || "Move closer or adjust lighting."}</span>
           </div>
@@ -516,6 +489,9 @@ export default function App() {
           </div>
         </div>
       )}
+      
+      {/* Global Animation Styles */}
+    
 
     </div>
   );
