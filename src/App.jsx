@@ -19,13 +19,25 @@ const firebaseConfig = {
 };
 
 let auth, db;
+
+const hasFirebaseConfig =
+  firebaseConfig.apiKey &&
+  firebaseConfig.authDomain &&
+  firebaseConfig.projectId &&
+  firebaseConfig.appId;
+
 try {
-  const app = initializeApp(firebaseConfig);
-  auth = getAuth(app);
-  db = getFirestore(app);
+  if (hasFirebaseConfig) {
+    const app = initializeApp(firebaseConfig);
+    auth = getAuth(app);
+    db = getFirestore(app);
+  } else {
+    console.warn("Firebase env vars missing — running in OFFLINE mode.", firebaseConfig);
+  }
 } catch (e) {
   console.error("Firebase init error:", e);
 }
+
 
 // --- Helper: Text to Speech ---
 let OMNI_VOICE = null;
@@ -116,19 +128,36 @@ export default function App() {
   }, []);
 
   // --- Auth & Init ---
-  useEffect(() => {
-    if (!auth) return;
-    const initAuth = async () => {
-      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+// --- Auth & Init ---
+useEffect(() => {
+  if (!auth) {
+    console.warn("Auth not initialized (Firebase OFFLINE). Check env vars.");
+    return;
+  }
+
+  const initAuth = async () => {
+    try {
+      // Hackathon preview token (ignore if not present)
+      if (typeof __initial_auth_token !== "undefined" && __initial_auth_token) {
         await signInWithCustomToken(auth, __initial_auth_token);
       } else {
         await signInAnonymously(auth);
       }
-    };
-    initAuth();
-    const unsubscribe = onAuthStateChanged(auth, setUser);
-    return () => unsubscribe();
-  }, []);
+      console.log("Signed in ✅");
+    } catch (e) {
+      console.error("Sign-in failed ❌", e);
+    }
+  };
+
+  initAuth();
+
+  const unsubscribe = onAuthStateChanged(auth, (u) => {
+    console.log("Auth state:", u?.uid);
+    setUser(u);
+  });
+
+  return () => unsubscribe();
+}, []);
 
   // --- Camera Logic ---
   const startCamera = async () => {
