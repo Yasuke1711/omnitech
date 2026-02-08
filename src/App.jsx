@@ -1,11 +1,23 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Camera, Mic, ShieldAlert, ShieldCheck, Activity, Zap, FileText, ScanEye, ListChecks, X } from 'lucide-react';
+import {
+  Camera,
+  Mic,
+  ShieldAlert,
+  ShieldCheck,
+  Activity,
+  Zap,
+  FileText,
+  ScanEye,
+  ListChecks,
+  X,
+  Loader2,
+} from 'lucide-react';
 import { initializeApp } from "firebase/app";
 import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "firebase/auth";
 import { getFirestore, collection, addDoc, serverTimestamp } from "firebase/firestore";
 
 // --- Configuration & Constants ---
-const API_KEY = import.meta.env.VITE_GEMINI_API_KEY; 
+const API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 const GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025";
 
 // --- Firebase Setup ---
@@ -19,25 +31,13 @@ const firebaseConfig = {
 };
 
 let auth, db;
-
-const hasFirebaseConfig =
-  firebaseConfig.apiKey &&
-  firebaseConfig.authDomain &&
-  firebaseConfig.projectId &&
-  firebaseConfig.appId;
-
 try {
-  if (hasFirebaseConfig) {
-    const app = initializeApp(firebaseConfig);
-    auth = getAuth(app);
-    db = getFirestore(app);
-  } else {
-    console.warn("Firebase env vars missing — running in OFFLINE mode.", firebaseConfig);
-  }
+  const app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db = getFirestore(app);
 } catch (e) {
   console.error("Firebase init error:", e);
 }
-
 
 // --- Helper: Text to Speech ---
 let OMNI_VOICE = null;
@@ -64,7 +64,6 @@ const pickBestVoice = () => {
     const match = pool.find(v => rx.test(v.name));
     if (match) return match;
   }
-
   return pool[0] || null;
 };
 
@@ -73,7 +72,6 @@ const ensureVoiceReady = () => {
   if (OMNI_VOICE) return;
 
   OMNI_VOICE = pickBestVoice();
-
   window.speechSynthesis.onvoiceschanged = () => {
     OMNI_VOICE = pickBestVoice();
   };
@@ -91,35 +89,41 @@ const speak = (text, opts = {}) => {
 
   if (OMNI_VOICE) u.voice = OMNI_VOICE;
 
-  // OmniTech voice tuning
-  u.rate = opts.rate ?? 1.02;   // calm, natural
+  u.rate = opts.rate ?? 1.02;   // calm
   u.pitch = opts.pitch ?? 0.88; // slightly deeper
   u.volume = opts.volume ?? 1.0;
 
   window.speechSynthesis.speak(u);
 };
 
-
 // --- Main Application Component ---
 export default function App() {
   const [user, setUser] = useState(null);
   const [isStreamActive, setIsStreamActive] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
-  const [systemState, setSystemState] = useState('IDLE'); // IDLE, SCANNING, DANGER, SAFE, UNCERTAIN
+  const [systemState, setSystemState] = useState('IDLE'); // IDLE, DANGER, SAFE, UNCERTAIN
   const [logs, setLogs] = useState([]);
   const [currentAnalysis, setCurrentAnalysis] = useState(null);
-  
-  // New State for LLM Features
+
   const [repairSteps, setRepairSteps] = useState(null);
   const [showRepairModal, setShowRepairModal] = useState(false);
+
   const [generatedReport, setGeneratedReport] = useState(null);
   const [showReportModal, setShowReportModal] = useState(false);
   const [generatingReport, setGeneratingReport] = useState(false);
-  const [activeTab, setActiveTab] = useState("safety"); 
+
+  const [activeTab, setActiveTab] = useState("safety");
+
+  // Input + feedback
+  const [userContext, setUserContext] = useState("");
+  const [contextFeedback, setContextFeedback] = useState(null);
+  const [isListening, setIsListening] = useState(false);
 
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const streamRef = useRef(null);
+
+  const recognitionRef = useRef(null);
 
   useEffect(() => {
     if (!window.speechSynthesis) return;
@@ -127,52 +131,88 @@ export default function App() {
     window.speechSynthesis.getVoices();
   }, []);
 
-// --- Auth & Init ---
-useEffect(() => {
-  if (!auth) {
-    console.warn("Auth not initialized (Firebase OFFLINE). Check env vars.");
-    return;
-  }
+  // --- Auth & Init ---
+  useEffect(() => {
+    if (!auth) return;
 
-  const initAuth = async () => {
-    try {
-      // Hackathon preview token (ignore if not present)
-      if (typeof __initial_auth_token !== "undefined" && __initial_auth_token) {
-        await signInWithCustomToken(auth, __initial_auth_token);
-      } else {
-        await signInAnonymously(auth);
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (e) {
+        console.error("Auth init error:", e);
       }
-      console.log("Signed in ✅");
-    } catch (e) {
-      console.error("Sign-in failed ❌", e);
-    }
+    };
+
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  const addLog = (source, message) => {
+    setLogs(prev => [{ source, message, time: new Date().toLocaleTimeString() }, ...prev]);
   };
 
-  initAuth();
-
-  const unsubscribe = onAuthStateChanged(auth, (u) => {
-    console.log("Auth state:", u?.uid);
-    setUser(u);
-  });
-
-  return () => unsubscribe();
-}, []);
-
-  // --- Camera Logic ---
+  // --- Camera Logic (safer constraints + guarded focus) ---
   const startCamera = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: false 
-      });
+      const constraints = {
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+        },
+        audio: false
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         streamRef.current = stream;
         setIsStreamActive(true);
+
+        // Try enable continuous focus if supported (guarded)
+        const track = stream.getVideoTracks()[0];
+        const capabilities = track.getCapabilities?.() || {};
+
+        if (capabilities.focusMode && Array.isArray(capabilities.focusMode) && capabilities.focusMode.includes('continuous')) {
+          try {
+            await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+          } catch {
+            // ignore
+          }
+        }
       }
     } catch (err) {
       console.error("Camera Error:", err);
-      addLog("SYSTEM", "Camera access denied or unavailable.");
+      addLog("SYSTEM", "Camera access denied. Check permissions.");
+    }
+  };
+
+  // Tap-to-focus (best-effort, guarded)
+  const handleTapToFocus = async (e) => {
+    // Don’t refocus if user clicked on UI elements
+    const tag = e?.target?.tagName?.toLowerCase();
+    if (tag === "button" || tag === "input" || tag === "svg" || tag === "path") return;
+
+    if (!streamRef.current) return;
+    const track = streamRef.current.getVideoTracks()[0];
+    const capabilities = track.getCapabilities?.() || {};
+
+    if (!capabilities.focusMode) return;
+
+    try {
+      // quick “nudge” — some devices re-lock focus
+      if (Array.isArray(capabilities.focusMode) && capabilities.focusMode.includes('continuous')) {
+        await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+        addLog("SYSTEM", "Refocusing optics...");
+      }
+    } catch {
+      // ignore if unsupported
     }
   };
 
@@ -180,76 +220,140 @@ useEffect(() => {
     if (!videoRef.current || !canvasRef.current) return null;
     const canvas = canvasRef.current;
     const video = videoRef.current;
-    
+
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
-    
+
     const ctx = canvas.getContext('2d');
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
     return canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
   };
 
+  // --- Voice Input Logic (FIXED: actually triggers diagnosis) ---
+  const toggleListening = () => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+    if (!SpeechRecognition) {
+      alert("Voice input not supported in this browser. Please type.");
+      return;
+    }
+
+    if (isListening) {
+      setIsListening(false);
+      try {
+        recognitionRef.current?.stop?.();
+      } catch { /* ignore */ }
+      return;
+    }
+
+    setIsListening(true);
+
+    const recognition = new SpeechRecognition();
+    recognitionRef.current = recognition;
+
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = 'en-US';
+
+    recognition.onresult = (event) => {
+      const transcript = (event.results?.[0]?.[0]?.transcript || "").trim();
+      if (!transcript) return;
+
+      setContextFeedback(`Voice: "${transcript}"`);
+      setTimeout(() => setContextFeedback(null), 2500);
+
+      // ✅ FIX: actually RUN diagnosis
+      callOmniTech("diagnosis", transcript);
+
+      setIsListening(false);
+      setUserContext(""); // optional: clear text field
+    };
+
+    recognition.onerror = () => setIsListening(false);
+    recognition.onend = () => setIsListening(false);
+
+    try {
+      recognition.start();
+    } catch {
+      setIsListening(false);
+    }
+  };
+
   // --- Gemini Integration ---
-  const callOmniTech = async (mode = "safety_check", userContext = "") => {
+  const callOmniTech = async (mode = "safety_check", manualContext = "") => {
     setAnalyzing(true);
+
     const imageBase64 = captureFrame();
     if (!imageBase64) {
       setAnalyzing(false);
       return;
     }
 
-    // Dynamic System Prompt
+    // Use the passed context first, fallback to typed input
+    const finalContext = (manualContext || userContext || "").trim();
+
     let systemInstruction = `
-      You are OmniTech, an autonomous field agent responsible for human safety and system diagnosis.
-      
-      CORE PROTOCOLS:
-      1. REFUSAL AUTHORITY: If a hazard is present (water, live wires, fire), you MUST refuse to give repair instructions. State clearly: "For your safety, I cannot proceed until [hazard] is resolved."
-      2. EPISTEMIC HUMILITY: If the image is blurry, too dark, or the component is obstructed, return status "UNCERTAIN". Do not guess.
-      
-      OUTPUT FORMAT (JSON ONLY):
-      {
-        "status": "SAFE" | "DANGER" | "UNCERTAIN",
-        "headline": "Short 3-5 word alert",
-        "reasoning": "One concise sentence on visual evidence.",
-        "action_required": "Direct instruction to user.",
-        "repair_steps": ["Step 1", "Step 2"] // Only populate this in 'repair_guide' mode
-      }
-    `;
+You are OmniTech, an autonomous field agent responsible for human safety and system diagnosis.
+
+CORE PROTOCOLS:
+1. REFUSAL AUTHORITY: If a hazard is present (water, live wires, fire), you MUST refuse repair instructions. Say: "For your safety, I cannot proceed until [hazard] is resolved."
+2. EPISTEMIC HUMILITY: If image is blurry/dark/obstructed, return status "UNCERTAIN". Do not guess.
+
+OUTPUT FORMAT (JSON ONLY):
+{
+  "status": "SAFE" | "DANGER" | "UNCERTAIN",
+  "headline": "Short 3-5 word alert",
+  "reasoning": "One concise sentence on visual evidence.",
+  "action_required": "Direct instruction to user.",
+  "repair_steps": ["Step 1", "Step 2"]
+}
+`;
 
     if (mode === "safety_check") {
-      systemInstruction += `TASK: Scan for immediate hazards. If unsure/blocked -> UNCERTAIN. If safe -> SAFE. If hazardous -> DANGER.`;
+      systemInstruction += ` TASK: Scan for immediate hazards.`;
     } else if (mode === "diagnosis") {
-      systemInstruction += `TASK: Diagnose failure. CRITICAL: If safety hazard seen -> DANGER and stop.`;
+      systemInstruction += ` TASK: Diagnose likely failure. If hazard seen -> DANGER and stop.`;
     } else if (mode === "repair_guide") {
-      systemInstruction += `TASK: Provide step-by-step repair guide. Assume safety confirmed. Populate 'repair_steps'.`;
+      systemInstruction += ` TASK: Provide step-by-step repair guide. Assume safety confirmed.`;
     }
 
     try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${API_KEY}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{
-            parts: [
-              { text: userContext ? `User Note: ${userContext}` : "Analyze this scene." },
-              { inlineData: { mimeType: "image/jpeg", data: imageBase64 } }
-            ]
-          }],
-          generationConfig: {
-            responseMimeType: "application/json",
-            maxOutputTokens: 600,
-            temperature: 0.4
-          },
-          systemInstruction: { parts: [{ text: systemInstruction }] }
-        })
-      });
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{
+              parts: [
+                { text: finalContext ? `User Context: ${finalContext}` : "Analyze this scene." },
+                { inlineData: { mimeType: "image/jpeg", data: imageBase64 } }
+              ]
+            }],
+            generationConfig: {
+              responseMimeType: "application/json",
+              maxOutputTokens: 800,
+              temperature: 0.4
+            },
+            systemInstruction: { parts: [{ text: systemInstruction }] }
+          })
+        }
+      );
 
       const data = await response.json();
       const resultText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      
+
       if (resultText) {
-        const result = JSON.parse(resultText);
-        handleAnalysisResult(result, mode);
+        try {
+          const cleanText = resultText.replace(/```json\n?|```/g, '').trim();
+          const result = JSON.parse(cleanText);
+          handleAnalysisResult(result, mode);
+        } catch (parseErr) {
+          console.error("JSON Parse Error:", parseErr, "Raw:", resultText);
+          addLog("SYSTEM", "AI returned invalid JSON. Please try again.");
+        }
+      } else {
+        addLog("SYSTEM", "No response from AI. Please try again.");
       }
     } catch (e) {
       console.error(e);
@@ -262,21 +366,26 @@ useEffect(() => {
   const generateFieldReport = async () => {
     if (logs.length === 0) return;
     setGeneratingReport(true);
+
     const logText = logs.map(l => `[${l.time}] ${l.source}: ${l.message}`).join("\n");
-    
+
     try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${API_KEY}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: `Generate a professional Field Incident Report based on these raw system logs:\n\n${logText}` }] }],
-          generationConfig: { maxOutputTokens: 500, temperature: 0.7 },
-          systemInstruction: { parts: [{ text: "You are a Senior Field Supervisor. Format the output as a clean, professional report." }] }
-        })
-      });
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: `Generate a professional Field Incident Report based on these raw logs:\n\n${logText}` }] }],
+            generationConfig: { maxOutputTokens: 500, temperature: 0.7 },
+            systemInstruction: { parts: [{ text: "You are a Senior Field Supervisor. Format the output as a clean report." }] }
+          })
+        }
+      );
+
       const data = await response.json();
       const report = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      setGeneratedReport(report);
+      setGeneratedReport(report || "No report generated.");
       setShowReportModal(true);
       addLog("SYSTEM", "Field Report generated.");
     } catch (e) {
@@ -293,30 +402,29 @@ useEffect(() => {
       setShowRepairModal(true);
       return;
     }
+
     setCurrentAnalysis(result);
     setSystemState(result.status);
+
     speak(`${result.headline}. ${result.action_required}`);
     addLog("OMNITECH", result.reasoning);
 
     if (user && db) {
       try {
-        addDoc(collection(db, 'artifacts', 'omnitech', 'users', user.uid, 'safety_events')
-                , {
+        addDoc(collection(db, 'artifacts', 'omnitech', 'users', user.uid, 'safety_events'), {
           timestamp: serverTimestamp(),
-          mode: mode,
+          mode,
           ...result
         });
-      } catch (e) { console.error("Save failed", e); }
+      } catch (e) {
+        console.error("Save failed", e);
+      }
     }
-  };
-
-  const addLog = (source, message) => {
-    setLogs(prev => [{ source, message, time: new Date().toLocaleTimeString() }, ...prev]);
   };
 
   // --- Render Helpers ---
   const getStatusColor = () => {
-    switch(systemState) {
+    switch (systemState) {
       case 'DANGER': return 'border-red-500 shadow-[0_0_80px_rgba(239,68,68,0.6)]';
       case 'SAFE': return 'border-emerald-500 shadow-[0_0_80px_rgba(16,185,129,0.4)]';
       case 'UNCERTAIN': return 'border-amber-500 shadow-[0_0_80px_rgba(245,158,11,0.4)]';
@@ -325,7 +433,7 @@ useEffect(() => {
   };
 
   const getStatusText = () => {
-    switch(systemState) {
+    switch (systemState) {
       case 'DANGER': return 'HAZARD DETECTED';
       case 'SAFE': return 'SYSTEM SECURE';
       case 'UNCERTAIN': return 'ANALYSIS INCONCLUSIVE';
@@ -333,45 +441,52 @@ useEffect(() => {
     }
   };
 
-  // Styles
-  const btnPrimary = "inline-flex items-center justify-center gap-2 rounded-full font-bold tracking-widest uppercase transition-all duration-200 ease-out select-none shadow-[0_10px_30px_-10px_rgba(34,211,238,0.5)] bg-cyan-600 hover:bg-cyan-500 text-white px-10 py-4";
-  const sheen = "relative overflow-hidden before:content-[''] before:absolute before:inset-0 before:opacity-0 hover:before:opacity-100 before:transition-opacity before:bg-[radial-gradient(circle_at_50%_0%,rgba(255,255,255,0.2),transparent_60%)]";
+  const btnPrimary =
+    "inline-flex items-center justify-center gap-2 rounded-full font-bold tracking-widest uppercase transition-all duration-200 ease-out select-none shadow-[0_10px_30px_-10px_rgba(34,211,238,0.5)] bg-cyan-600 hover:bg-cyan-500 text-white px-10 py-4";
+  const sheen =
+    "relative overflow-hidden before:content-[''] before:absolute before:inset-0 before:opacity-0 hover:before:opacity-100 before:transition-opacity before:bg-[radial-gradient(circle_at_50%_0%,rgba(255,255,255,0.2),transparent_60%)]";
+
+  // ✅ FIX: Text submit runs diagnosis
+  const submitTextDiagnosis = () => {
+    const clean = userContext.trim();
+    if (!clean) return;
+
+    setContextFeedback(`Sent: "${clean}"`);
+    setTimeout(() => setContextFeedback(null), 2500);
+
+    callOmniTech("diagnosis", clean);
+    setUserContext("");
+  };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 font-sans overflow-hidden flex flex-col relative selection:bg-cyan-500/30">
-      
+
       {/* --- BACKGROUND EFFECTS --- */}
       <div className="fixed inset-0 z-0 pointer-events-none overflow-hidden">
-        {/* 1. Cyberpunk Grid */}
         <div className="absolute inset-0 bg-[linear-gradient(to_right,#1f2937_1px,transparent_1px),linear-gradient(to_bottom,#1f2937_1px,transparent_1px)] bg-[size:40px_40px] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_0%,#000_70%,transparent_100%)] opacity-20" />
-        
-        {/* 2. Energy Surges (Pulsing Orbs) */}
-        <div className={`absolute top-[-10%] left-[-10%] w-[500px] h-[500px] rounded-full blur-[100px] mix-blend-screen animate-pulse opacity-20 transition-colors duration-1000 ${
-          systemState === 'DANGER' ? 'bg-red-600' : 'bg-cyan-600'
-        }`} />
-        <div className={`absolute bottom-[-10%] right-[-10%] w-[500px] h-[500px] rounded-full blur-[100px] mix-blend-screen animate-pulse opacity-20 delay-1000 transition-colors duration-1000 ${
-          systemState === 'DANGER' ? 'bg-orange-600' : 'bg-emerald-600'
-        }`} />
-
-        {/* 3. The Scanner Beam (Moves down the screen) */}
+        <div className={`absolute top-[-10%] left-[-10%] w-[500px] h-[500px] rounded-full blur-[100px] mix-blend-screen animate-pulse opacity-20 transition-colors duration-1000 ${systemState === 'DANGER' ? 'bg-red-600' : 'bg-cyan-600'}`} />
+        <div className={`absolute bottom-[-10%] right-[-10%] w-[500px] h-[500px] rounded-full blur-[100px] mix-blend-screen animate-pulse opacity-20 delay-1000 transition-colors duration-1000 ${systemState === 'DANGER' ? 'bg-orange-600' : 'bg-emerald-600'}`} />
         {isStreamActive && !analyzing && (
-           <div className="absolute inset-0 z-0 pointer-events-none">
-             <div className="w-full h-[2px] bg-gradient-to-r from-transparent via-cyan-400/50 to-transparent absolute top-0 animate-[scan_3s_linear_infinite]" />
-           </div>
+          <div className="absolute inset-0 z-0 pointer-events-none">
+            <div className="w-full h-[2px] bg-gradient-to-r from-transparent via-cyan-400/50 to-transparent absolute top-0 animate-[scan_3s_linear_infinite] will-change-transform" />
+          </div>
         )}
       </div>
 
       {/* --- HUD Overlay --- */}
       <div className={`absolute inset-0 pointer-events-none border-[12px] transition-all duration-500 z-20 ${getStatusColor()} opacity-80`} />
-      
+
       {/* --- Header --- */}
       <div className="absolute top-0 left-0 right-0 z-30 p-4 flex justify-between items-start bg-gradient-to-b from-black/80 to-transparent">
         <div>
           <h1 className="text-2xl font-bold tracking-widest text-cyan-400 flex items-center gap-2 drop-shadow-[0_0_10px_rgba(34,211,238,0.8)]">
             <Activity className="w-6 h-6 animate-pulse" /> OMNI<span className="text-white">TECH</span>
           </h1>
-          <p className="text-xs text-slate-400 font-mono mt-1">UNIT: {user ? user.uid.slice(0,6) : 'OFFLINE'} // V.3.2.0</p>
+          <p className="text-xs text-slate-400 font-mono mt-1">
+            UNIT: {user ? user.uid.slice(0, 6) : 'OFFLINE'} // V.3.2.0
+          </p>
         </div>
+
         <div className={`px-4 py-2 rounded-sm border backdrop-blur-md font-mono font-bold tracking-widest shadow-lg ${
           systemState === 'DANGER' ? 'bg-red-900/50 border-red-500 text-red-100 animate-pulse shadow-red-500/20' :
           systemState === 'SAFE' ? 'bg-emerald-900/50 border-emerald-500 text-emerald-100 shadow-emerald-500/20' :
@@ -383,7 +498,7 @@ useEffect(() => {
       </div>
 
       {/* --- Main Viewport --- */}
-      <div className="flex-1 relative bg-black flex items-center justify-center overflow-hidden z-10">
+      <div className="flex-1 relative bg-black flex items-center justify-center overflow-hidden z-10" onClick={handleTapToFocus}>
         {!isStreamActive && (
           <div className="absolute inset-0 flex flex-col items-center justify-center z-10 bg-slate-900/80 backdrop-blur-sm">
             <div className="relative">
@@ -394,8 +509,14 @@ useEffect(() => {
             <p className="mt-4 text-slate-500 font-mono text-sm">Waiting for visual input...</p>
           </div>
         )}
-        
-        <video ref={videoRef} autoPlay playsInline muted className={`w-full h-full object-cover transition-opacity duration-700 ${isStreamActive ? 'opacity-100' : 'opacity-20'}`} />
+
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          muted
+          className={`w-full h-full object-cover transition-opacity duration-700 ${isStreamActive ? 'opacity-100' : 'opacity-20'}`}
+        />
         <canvas ref={canvasRef} className="hidden" />
 
         {/* --- Scanning Overlay --- */}
@@ -403,7 +524,9 @@ useEffect(() => {
           <div className="absolute inset-0 z-20 flex items-center justify-center bg-cyan-900/10 backdrop-blur-[2px]">
             <div className="relative">
               <div className="w-24 h-24 border-4 border-cyan-400 border-t-transparent rounded-full animate-spin" />
-              <div className="absolute inset-0 flex items-center justify-center font-mono text-xs text-cyan-300 animate-pulse">ANALYZING</div>
+              <div className="absolute inset-0 flex items-center justify-center font-mono text-xs text-cyan-300 animate-pulse">
+                ANALYZING
+              </div>
             </div>
           </div>
         )}
@@ -420,17 +543,21 @@ useEffect(() => {
             <h3 className="text-lg font-bold text-white mb-1 leading-tight">{currentAnalysis.headline}</h3>
             <p className="text-sm text-slate-300 mb-3">{currentAnalysis.reasoning}</p>
             <div className={`p-3 rounded border-l-4 mb-3 ${
-              currentAnalysis.status === 'DANGER' ? 'bg-red-900/30 border-red-500' : 
+              currentAnalysis.status === 'DANGER' ? 'bg-red-900/30 border-red-500' :
               currentAnalysis.status === 'UNCERTAIN' ? 'bg-amber-900/30 border-amber-500' :
               'bg-cyan-900/30 border-cyan-500'
             }`}>
               <span className="block text-xs font-bold uppercase opacity-70 mb-1">Recommended Action</span>
               <p className="text-sm font-medium text-white">{currentAnalysis.action_required}</p>
             </div>
+
             {currentAnalysis.status === 'SAFE' && (
-               <button onClick={() => callOmniTech("repair_guide")} className="w-full py-2 bg-emerald-900/40 hover:bg-emerald-900/60 border border-emerald-700 rounded text-emerald-100 text-sm font-bold flex items-center justify-center gap-2 transition-colors">
-                 <ListChecks className="w-4 h-4" /> ✨ View Repair Steps
-               </button>
+              <button
+                onClick={(e) => { e.stopPropagation(); callOmniTech("repair_guide"); }}
+                className="w-full py-2 bg-emerald-900/40 hover:bg-emerald-900/60 border border-emerald-700 rounded text-emerald-100 text-sm font-bold flex items-center justify-center gap-2 transition-colors"
+              >
+                <ListChecks className="w-4 h-4" /> ✨ View Repair Steps
+              </button>
             )}
           </div>
         )}
@@ -439,51 +566,58 @@ useEffect(() => {
       {/* --- Control Deck --- */}
       <div className="z-30 bg-slate-950 border-t border-slate-800 p-4 pb-8 shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
         <div className="max-w-4xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-4">
-          
+
           {/* Logs */}
           <div className="hidden md:flex flex-col h-40 bg-slate-900/50 p-2 rounded border border-slate-800 backdrop-blur-md">
             <div className="flex justify-between items-center mb-2 pb-2 border-b border-slate-800">
               <span className="text-xs font-mono text-slate-500">SESSION LOGS</span>
-              <button onClick={generateFieldReport} disabled={logs.length < 2 || generatingReport} className="text-xs bg-slate-800 hover:bg-slate-700 text-cyan-400 px-2 py-1 rounded flex items-center gap-1 transition-colors disabled:opacity-50">
+              <button
+                onClick={(e) => { e.stopPropagation(); generateFieldReport(); }}
+                disabled={logs.length < 2 || generatingReport}
+                className="text-xs bg-slate-800 hover:bg-slate-700 text-cyan-400 px-2 py-1 rounded flex items-center gap-1 transition-colors disabled:opacity-50"
+              >
                 {generatingReport ? <Activity className="w-3 h-3 animate-spin" /> : <FileText className="w-3 h-3" />} Report
               </button>
             </div>
             <div className="flex-1 overflow-y-auto font-mono text-xs text-slate-400 space-y-1">
               {logs.map((log, i) => (
-                <div key={i}><span className="text-slate-600">[{log.time}]</span> <span className={log.source === 'OMNITECH' ? 'text-cyan-400' : 'text-slate-300'}>{log.source}:</span> {log.message}</div>
+                <div key={i}>
+                  <span className="text-slate-600">[{log.time}]</span>{" "}
+                  <span className={log.source === 'OMNITECH' ? 'text-cyan-400' : 'text-slate-300'}>{log.source}:</span>{" "}
+                  {log.message}
+                </div>
               ))}
             </div>
           </div>
 
           {/* Controls */}
           <div className="flex flex-col gap-3">
-            
-            {/* GOOGLE PLAY STYLE SLIDING CONTROLS */}
-            <div className="relative flex w-full h-16 bg-slate-900/80 rounded-full p-1 ring-1 ring-white/10 backdrop-blur-md overflow-hidden shadow-inner shadow-black/50">
-              
-              {/* Sliding Background */}
-              <div 
-                className={`absolute top-1 bottom-1 left-1 w-[calc(50%-4px)] rounded-full transition-transform duration-300 ease-out z-0 shadow-lg shadow-cyan-900/50 bg-cyan-600 ${
-                  activeTab === 'safety' ? 'translate-x-0' : 'translate-x-full'
-                }`} 
-              />
 
-              {/* Safety Button */}
-              <button 
-                onClick={() => { setActiveTab('safety'); callOmniTech("safety_check"); }}
+            {/* Sliding Pill */}
+            <div className="relative flex w-full h-16 bg-slate-900/80 rounded-full p-1 ring-1 ring-white/10 backdrop-blur-md overflow-hidden shadow-inner shadow-black/50">
+              <div className={`absolute top-1 bottom-1 left-1 w-[calc(50%-4px)] rounded-full transition-transform duration-300 ease-out z-0 shadow-lg shadow-cyan-900/50 bg-cyan-600 ${
+                activeTab === 'safety' ? 'translate-x-0' : 'translate-x-full'
+              }`} />
+
+              <button
+                onClick={(e) => { e.stopPropagation(); setActiveTab('safety'); callOmniTech("safety_check"); }}
                 disabled={!isStreamActive || analyzing}
-                className={`flex-1 relative z-10 flex items-center justify-center gap-2 font-bold tracking-wide transition-colors duration-200 ${activeTab === 'safety' ? 'text-white' : 'text-slate-400 hover:text-slate-200'}`}
+                className={`flex-1 relative z-10 flex items-center justify-center gap-2 font-bold tracking-wide transition-colors duration-200 ${
+                  activeTab === 'safety' ? 'text-white' : 'text-slate-400 hover:text-slate-200'
+                }`}
               >
                 <ShieldCheck className="w-5 h-5" /> SAFETY
               </button>
 
-              {/* Diagnose Button */}
-              <button 
-                onClick={() => { setActiveTab('diagnose'); callOmniTech("diagnosis"); }}
+              <button
+                onClick={(e) => { e.stopPropagation(); setActiveTab('diagnose'); callOmniTech("diagnosis"); }}
                 disabled={!isStreamActive || analyzing || systemState === 'DANGER' || systemState === 'UNCERTAIN'}
                 className={`flex-1 relative z-10 flex items-center justify-center gap-2 font-bold tracking-wide transition-colors duration-200 ${
-                  systemState === 'DANGER' || systemState === 'UNCERTAIN' ? 'opacity-30 cursor-not-allowed' :
-                  activeTab === 'diagnose' ? 'text-white' : 'text-slate-400 hover:text-slate-200'
+                  systemState === 'DANGER' || systemState === 'UNCERTAIN'
+                    ? 'opacity-30 cursor-not-allowed'
+                    : activeTab === 'diagnose'
+                      ? 'text-white'
+                      : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
                 {systemState === 'DANGER' ? <ShieldAlert className="w-5 h-5 text-red-400" /> : <Zap className="w-5 h-5" />}
@@ -491,41 +625,65 @@ useEffect(() => {
               </button>
             </div>
 
-            {/* Input */}
-            <div className="relative">
-              <input 
-                type="text" 
-                placeholder="Describe issue (or use voice)..." 
-                className="w-full bg-slate-900 border border-slate-700 rounded px-4 py-3 text-sm focus:outline-none focus:border-cyan-500 transition-colors shadow-inner"
-                onKeyDown={(e) => { if (e.key === 'Enter') { callOmniTech("diagnosis", e.target.value); e.target.value = ''; } }}
+            {/* Input + Feedback */}
+            <div className="relative" onClick={(e) => e.stopPropagation()}>
+              {contextFeedback && (
+                <div className="absolute -top-8 left-0 right-0 flex justify-center">
+                  <div className="bg-cyan-900/90 text-cyan-100 text-xs font-bold px-3 py-1 rounded-full border border-cyan-500/30 flex items-center gap-2 shadow-lg">
+                    <Zap className="w-3 h-3" /> {contextFeedback}
+                  </div>
+                </div>
+              )}
+
+              <input
+                type="text"
+                value={userContext}
+                onChange={(e) => setUserContext(e.target.value)}
+                placeholder={isListening ? "Listening..." : "Describe issue (or use voice)..."}
+                className={`w-full bg-slate-900 border ${
+                  isListening ? 'border-emerald-500 animate-pulse' : 'border-slate-700'
+                } rounded px-4 py-3 text-sm focus:outline-none focus:border-cyan-500 transition-colors shadow-inner`}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') submitTextDiagnosis();
+                }}
               />
-              <Mic className="absolute right-3 top-3 w-5 h-5 text-slate-500 hover:text-cyan-400 cursor-pointer" />
+
+              <button
+                onClick={(e) => { e.stopPropagation(); toggleListening(); }}
+                className={`absolute right-2 top-2 p-1 rounded-full hover:bg-slate-800 transition-colors ${
+                  isListening ? 'text-emerald-500' : 'text-slate-500 hover:text-cyan-400'
+                }`}
+                aria-label="Voice input"
+              >
+                {isListening ? <Loader2 className="w-5 h-5 animate-spin" /> : <Mic className="w-5 h-5" />}
+              </button>
             </div>
           </div>
 
           {/* Metrics */}
           <div className="hidden md:flex flex-col gap-2 justify-center pl-4 border-l border-slate-800">
-             <div className="flex items-center justify-between text-xs font-mono text-slate-500"><span>INFERENCE</span><span className="text-cyan-400 animate-pulse">LIVE REAL-TIME</span></div>
-             <div className="flex items-center justify-between text-xs font-mono text-slate-500"><span>PROTECTION</span><span className="text-emerald-500">ACTIVE GUARD</span></div>
-             <div className="flex items-center justify-between text-xs font-mono text-slate-500"><span>VOICE MODULE</span><span className="text-slate-400">READY</span></div>
+            <div className="flex items-center justify-between text-xs font-mono text-slate-500"><span>INFERENCE</span><span className="text-cyan-400 animate-pulse">LIVE REAL-TIME</span></div>
+            <div className="flex items-center justify-between text-xs font-mono text-slate-500"><span>PROTECTION</span><span className="text-emerald-500">ACTIVE GUARD</span></div>
+            <div className="flex items-center justify-between text-xs font-mono text-slate-500"><span>VOICE</span><span className="text-slate-400">{isListening ? "LISTENING" : "READY"}</span></div>
           </div>
 
         </div>
       </div>
-      
+
       {/* Alert Banners */}
       {systemState === 'DANGER' && (
         <div className="absolute bottom-32 left-0 right-0 flex justify-center pointer-events-none z-50">
           <div className="bg-red-600/90 text-white px-6 py-3 rounded-md font-bold text-sm shadow-[0_0_30px_rgba(220,38,38,0.5)] flex items-center gap-3 max-w-md text-center animate-bounce">
-            <ShieldAlert className="w-6 h-6 flex-shrink-0" /> 
+            <ShieldAlert className="w-6 h-6 flex-shrink-0" />
             <span>PROTOCOL LOCKED: {currentAnalysis?.action_required || "Resolve hazard before proceeding."}</span>
           </div>
         </div>
       )}
+
       {systemState === 'UNCERTAIN' && (
         <div className="absolute bottom-32 left-0 right-0 flex justify-center pointer-events-none z-50">
           <div className="bg-amber-600/90 text-white px-6 py-3 rounded-md font-bold text-sm shadow-[0_0_30px_rgba(217,119,6,0.5)] flex items-center gap-3 max-w-md text-center">
-             <ScanEye className="w-6 h-6 flex-shrink-0" />
+            <ScanEye className="w-6 h-6 flex-shrink-0" />
             <span>VISUALS UNCLEAR: {currentAnalysis?.action_required || "Move closer or adjust lighting."}</span>
           </div>
         </div>
@@ -536,18 +694,26 @@ useEffect(() => {
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
           <div className="bg-slate-900 border border-slate-700 w-full max-w-lg rounded-lg shadow-2xl overflow-hidden flex flex-col max-h-[80vh]">
             <div className="p-4 bg-slate-800 border-b border-slate-700 flex justify-between items-center">
-              <h3 className="text-lg font-bold text-white flex items-center gap-2"><ListChecks className="w-5 h-5 text-emerald-400" /> Repair Protocol</h3>
-              <button onClick={() => setShowRepairModal(false)} className="text-slate-400 hover:text-white"><X className="w-5 h-5" /></button>
+              <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                <ListChecks className="w-5 h-5 text-emerald-400" /> Repair Protocol
+              </h3>
+              <button onClick={() => setShowRepairModal(false)} className="text-slate-400 hover:text-white">
+                <X className="w-5 h-5" />
+              </button>
             </div>
             <div className="p-6 overflow-y-auto space-y-4">
               {repairSteps?.map((step, idx) => (
                 <div key={idx} className="flex gap-3">
-                  <div className="flex-shrink-0 w-6 h-6 rounded-full bg-cyan-900 text-cyan-300 flex items-center justify-center font-mono text-xs border border-cyan-700">{idx + 1}</div>
+                  <div className="flex-shrink-0 w-6 h-6 rounded-full bg-cyan-900 text-cyan-300 flex items-center justify-center font-mono text-xs border border-cyan-700">
+                    {idx + 1}
+                  </div>
                   <p className="text-slate-300 text-sm">{step}</p>
                 </div>
               ))}
             </div>
-            <div className="p-4 bg-slate-950 border-t border-slate-800 text-xs text-center text-slate-500 font-mono">GENERATED BY OMNITECH CORE // VERIFY BEFORE ACTING</div>
+            <div className="p-4 bg-slate-950 border-t border-slate-800 text-xs text-center text-slate-500 font-mono">
+              GENERATED BY OMNITECH CORE // VERIFY BEFORE ACTING
+            </div>
           </div>
         </div>
       )}
@@ -557,21 +723,40 @@ useEffect(() => {
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
           <div className="bg-slate-900 border border-slate-700 w-full max-w-2xl rounded-lg shadow-2xl overflow-hidden flex flex-col max-h-[80vh]">
             <div className="p-4 bg-slate-800 border-b border-slate-700 flex justify-between items-center">
-              <h3 className="text-lg font-bold text-white flex items-center gap-2"><FileText className="w-5 h-5 text-cyan-400" /> Incident Report Preview</h3>
-              <button onClick={() => setShowReportModal(false)} className="text-slate-400 hover:text-white"><X className="w-5 h-5" /></button>
+              <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                <FileText className="w-5 h-5 text-cyan-400" /> Incident Report Preview
+              </h3>
+              <button onClick={() => setShowReportModal(false)} className="text-slate-400 hover:text-white">
+                <X className="w-5 h-5" />
+              </button>
             </div>
-            <div className="p-6 overflow-y-auto bg-white text-slate-900 font-mono text-sm leading-relaxed whitespace-pre-wrap">{generatedReport}</div>
+            <div className="p-6 overflow-y-auto bg-white text-slate-900 font-mono text-sm leading-relaxed whitespace-pre-wrap">
+              {generatedReport}
+            </div>
             <div className="p-4 bg-slate-950 border-t border-slate-800 flex justify-end gap-2">
-               <button onClick={() => setShowReportModal(false)} className="px-4 py-2 text-slate-400 hover:text-white text-sm">Close</button>
-               <button onClick={() => { navigator.clipboard.writeText(generatedReport); alert("Report copied to clipboard"); }} className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white text-sm font-bold rounded">Copy to Clipboard</button>
+              <button onClick={() => setShowReportModal(false)} className="px-4 py-2 text-slate-400 hover:text-white text-sm">
+                Close
+              </button>
+              <button
+                onClick={() => { navigator.clipboard.writeText(generatedReport || ""); alert("Report copied to clipboard"); }}
+                className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white text-sm font-bold rounded"
+              >
+                Copy to Clipboard
+              </button>
             </div>
           </div>
         </div>
       )}
-      
-      {/* Global Animation Styles */}
-    
 
+      {/* Global Animation Styles */}
+      <style>{`
+        @keyframes scan {
+          0% { top: 0; opacity: 0; }
+          10% { opacity: 1; }
+          90% { opacity: 1; }
+          100% { top: 100%; opacity: 0; }
+        }
+      `}</style>
     </div>
   );
 }
