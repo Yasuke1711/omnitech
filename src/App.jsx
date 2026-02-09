@@ -33,7 +33,7 @@ import {
   CONFIG
 ========================= */
 // App will automatically fall back to demo outputs on 429.
-const DEMO_MODE = true;
+const DEMO_MODE = false;
 
 const API_KEY = import.meta.env.VITE_GEMINI_API_KEY; // real key from Vercel/Vite env
 const GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025";
@@ -539,7 +539,7 @@ OUTPUT FORMAT (JSON ONLY):
         }),
       });
 
-      // If quota/rate limit hit — switch to demo so recording still looks alive
+      // If quota/rate limit hit — switch to demo
       if (response.status === 429) {
         const errText = await response.text().catch(() => "");
         addLog("ERROR", `Gemini HTTP 429 (quota/rate limit). Switching to demo output.`, "error");
