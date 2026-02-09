@@ -32,11 +32,17 @@ import {
 /* =========================
   CONFIG
 ========================= */
+// App will automatically fall back to demo outputs on 429.
+const DEMO_MODE = true;
 
-const API_KEY = import.meta.env.VITE_GEMINI_API_KEY; // ✅ real key from Vercel/Vite env
+const API_KEY = import.meta.env.VITE_GEMINI_API_KEY; // real key from Vercel/Vite env
 const GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025";
 
-// Firebase from env (Vercel) — must exist in Vercel Environment Variables
+// Anti-spam / rate protection (helps prevent 429 from user tapping)
+const COOLDOWN_MS = 2500; // minimum time between requests
+const MAX_CALLS_PER_MIN = 8; // soft cap (client-side)
+
+// Firebase from env (Vercel)
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
   authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
@@ -46,16 +52,14 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID,
 };
 
-// Optional: if you want a stable appId for Firestore paths
+// Optional: stable appId for Firestore paths
 const appId = import.meta.env.VITE_FIREBASE_APP_ID || "default-app-id";
 
 /* =========================
   FIREBASE INIT
 ========================= */
-
 let auth, db;
 try {
-  // ✅ Real check (not Object.keys length)
   if (firebaseConfig?.apiKey) {
     const app = initializeApp(firebaseConfig);
     auth = getAuth(app);
@@ -68,9 +72,8 @@ try {
 }
 
 /* =========================
-  TTS (Browser SpeechSynthesis)
+  TTS
 ========================= */
-
 let OMNI_VOICE = null;
 
 const pickBestVoice = () => {
@@ -100,11 +103,7 @@ const pickBestVoice = () => {
 
 const ensureVoiceReady = () => {
   if (!window.speechSynthesis) return;
-
-  // Try
   if (!OMNI_VOICE) OMNI_VOICE = pickBestVoice();
-
-  // And again whenever voices finish loading
   window.speechSynthesis.onvoiceschanged = () => {
     OMNI_VOICE = pickBestVoice();
   };
@@ -122,7 +121,6 @@ const speak = (text, opts = {}) => {
 
   if (OMNI_VOICE) u.voice = OMNI_VOICE;
 
-  // Voice tuning
   u.rate = opts.rate ?? 1.02;
   u.pitch = opts.pitch ?? 0.88;
   u.volume = opts.volume ?? 1.0;
@@ -133,7 +131,6 @@ const speak = (text, opts = {}) => {
 /* =========================
   TOAST UI
 ========================= */
-
 const Toast = ({ message, type, onClose }) => {
   useEffect(() => {
     const t = setTimeout(onClose, 4000);
@@ -160,16 +157,88 @@ const Toast = ({ message, type, onClose }) => {
 };
 
 /* =========================
+  DEMO FALLBACK (for recording)
+========================= */
+const getDemoResult = (mode, step = 0) => {
+  const demo = [
+    {
+      status: "DANGER",
+      headline: "Liquid Hazard Near Electronics",
+      reasoning:
+        "A container of liquid is placed close to exposed electronics, increasing spill and short-circuit risk.",
+      action_required:
+        "Move the liquid away and dry the area before continuing.",
+      repair_steps: [],
+    },
+    {
+      status: "UNCERTAIN",
+      headline: "Image Quality Too Poor",
+      reasoning:
+        "The image is too blurry/low-detail to confirm cable condition or hazards.",
+      action_required:
+        "Move closer, improve lighting, and hold still for a clear frame.",
+      repair_steps: [],
+    },
+    {
+      status: "SAFE",
+      headline: "Environment Appears Clear",
+      reasoning:
+        "No immediate hazards are visible; workspace looks stable and dry.",
+      action_required:
+        "Proceed with diagnosis. Keep hands dry and avoid exposed contacts.",
+      repair_steps: [
+        "Power off the device and unplug it (if safe).",
+        "Inspect connectors for looseness or debris.",
+        "Reseat the cable firmly and check for damage.",
+        "Power on and re-test the system behavior.",
+        "If issue persists, replace the cable/component.",
+      ],
+    },
+  ];
+
+  const pick = demo[step % demo.length];
+
+  if (mode === "repair_guide") {
+    return {
+      status: "SAFE",
+      headline: "Repair Protocol Ready",
+      reasoning: "Safety confirmed. Providing step-by-step repair guidance.",
+      action_required: "Follow steps carefully. Stop if heat/smoke appears.",
+      repair_steps: pick.repair_steps?.length
+        ? pick.repair_steps
+        : demo[2].repair_steps,
+    };
+  }
+
+  if (mode === "diagnosis") {
+    // Slightly different “diagnosis” flavor
+    return {
+      ...pick,
+      headline:
+        pick.status === "SAFE"
+          ? "Fault Likely: Loose Connection"
+          : pick.headline,
+      reasoning:
+        pick.status === "SAFE"
+          ? "Visual cues suggest an intermittent connection; reseating and inspection is recommended."
+          : pick.reasoning,
+    };
+  }
+
+  // safety_check
+  return pick;
+};
+
+/* =========================
   MAIN APP
 ========================= */
-
 export default function App() {
   const [user, setUser] = useState(null);
 
   const [isStreamActive, setIsStreamActive] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
 
-  const [systemState, setSystemState] = useState("IDLE"); // IDLE, SAFE, DANGER, UNCERTAIN
+  const [systemState, setSystemState] = useState("IDLE");
   const [logs, setLogs] = useState([]);
   const [currentAnalysis, setCurrentAnalysis] = useState(null);
 
@@ -181,19 +250,24 @@ export default function App() {
   const [generatingReport, setGeneratingReport] = useState(false);
 
   const [activeTab, setActiveTab] = useState("safety");
+  const [demoStep, setDemoStep] = useState(0);
 
   const [userContext, setUserContext] = useState("");
   const [isListening, setIsListening] = useState(false);
 
-  const [toast, setToast] = useState(null); // { message, type }
+  const [toast, setToast] = useState(null);
 
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const streamRef = useRef(null);
-
   const recognitionRef = useRef(null);
 
-  // Ensure TTS voices load
+  // Anti-spam refs
+  const inFlightRef = useRef(false);
+  const lastCallAtRef = useRef(0);
+  const callTimestampsRef = useRef([]); // for MAX_CALLS_PER_MIN
+
+  // Ensure voices load
   useEffect(() => {
     if (!window.speechSynthesis) return;
     ensureVoiceReady();
@@ -208,7 +282,6 @@ export default function App() {
 
     const initAuth = async () => {
       try {
-        // Works in Firebase-hosted preview environments if available
         if (typeof __initial_auth_token !== "undefined" && __initial_auth_token) {
           await signInWithCustomToken(auth, __initial_auth_token);
         } else {
@@ -259,7 +332,6 @@ export default function App() {
         streamRef.current = stream;
         setIsStreamActive(true);
 
-        // Try continuous focus if device supports it
         const track = stream.getVideoTracks()[0];
         const capabilities = track?.getCapabilities?.() || {};
         if (
@@ -269,9 +341,7 @@ export default function App() {
         ) {
           try {
             await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
-          } catch {
-            // ignore
-          }
+          } catch {}
         }
       }
     } catch (err) {
@@ -280,12 +350,9 @@ export default function App() {
     }
   };
 
-  // Tap-to-focus (best-effort; many phones ignore it)
   const handleTapToFocus = async (e) => {
     const tag = e?.target?.tagName?.toLowerCase();
-    if (tag === "button" || tag === "input" || tag === "svg" || tag === "path")
-      return;
-
+    if (tag === "button" || tag === "input" || tag === "svg" || tag === "path") return;
     if (!streamRef.current) return;
 
     const track = streamRef.current.getVideoTracks()[0];
@@ -293,24 +360,16 @@ export default function App() {
     if (!capabilities.focusMode) return;
 
     try {
-      if (
-        Array.isArray(capabilities.focusMode) &&
-        capabilities.focusMode.includes("continuous")
-      ) {
+      if (Array.isArray(capabilities.focusMode) && capabilities.focusMode.includes("continuous")) {
         await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
   };
 
   const captureFrame = () => {
     if (!videoRef.current || !canvasRef.current) return null;
-
     const canvas = canvasRef.current;
     const video = videoRef.current;
-
-    // Sometimes mobile takes a moment to populate these
     if (!video.videoWidth || !video.videoHeight) return null;
 
     canvas.width = video.videoWidth;
@@ -322,30 +381,22 @@ export default function App() {
   };
 
   /* -------------------------
-    VOICE INPUT (SpeechRecognition)
+    VOICE INPUT
   ------------------------- */
   const toggleListening = () => {
-    const SpeechRecognition =
-      window.SpeechRecognition || window.webkitSpeechRecognition;
-
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
       setToast({ message: "Voice input not supported in this browser.", type: "error" });
       return;
     }
 
-    // Stop if already listening
     if (isListening) {
       setIsListening(false);
-      try {
-        recognitionRef.current?.stop?.();
-      } catch {
-        // ignore
-      }
+      try { recognitionRef.current?.stop?.(); } catch {}
       return;
     }
 
     setIsListening(true);
-
     const recognition = new SpeechRecognition();
     recognitionRef.current = recognition;
 
@@ -371,34 +422,69 @@ export default function App() {
 
     recognition.onend = () => setIsListening(false);
 
-    try {
-      recognition.start();
-    } catch {
-      setIsListening(false);
+    try { recognition.start(); } catch { setIsListening(false); }
+  };
+
+  /* -------------------------
+    CLIENT-SIDE RATE GUARD
+  ------------------------- */
+  const canCallNow = () => {
+    const now = Date.now();
+
+    // In-flight lock: prevent double-tap flooding
+    if (inFlightRef.current) return { ok: false, reason: "Request in progress..." };
+
+    // Cooldown
+    const delta = now - lastCallAtRef.current;
+    if (delta < COOLDOWN_MS) {
+      const wait = Math.ceil((COOLDOWN_MS - delta) / 1000);
+      return { ok: false, reason: `Cooldown: wait ${wait}s` };
     }
+
+    // Per-minute soft cap
+    const oneMinAgo = now - 60_000;
+    callTimestampsRef.current = callTimestampsRef.current.filter((t) => t > oneMinAgo);
+
+    if (callTimestampsRef.current.length >= MAX_CALLS_PER_MIN) {
+      return { ok: false, reason: "Rate limit: too many requests/min" };
+    }
+
+    return { ok: true };
   };
 
   /* -------------------------
     GEMINI CALL
   ------------------------- */
   const callOmniTech = async (mode = "safety_check", manualContext = "") => {
-    setAnalyzing(true);
+    // Rate guard first
+    const guard = canCallNow();
+    if (!guard.ok) {
+      setToast({ message: guard.reason, type: "error" });
+      return;
+    }
 
-    // Fix: don’t even try if key missing
+    lastCallAtRef.current = Date.now();
+    callTimestampsRef.current.push(lastCallAtRef.current);
+
+    setAnalyzing(true);
+    inFlightRef.current = true;
+
+    // If no key, demo fallback (helps recording)
     if (!API_KEY) {
-      addLog(
-        "ERROR",
-        "Missing VITE_GEMINI_API_KEY. Add it in Vercel env vars and redeploy.",
-        "error"
-      );
+      addLog("ERROR", "Missing VITE_GEMINI_API_KEY. Using demo output.", "error");
+      const demo = getDemoResult(mode, demoStep);
+      setDemoStep((s) => s + 1);
+      handleAnalysisResult(demo, mode, { skipSave: true });
       setAnalyzing(false);
+      inFlightRef.current = false;
       return;
     }
 
     const imageBase64 = captureFrame();
     if (!imageBase64) {
-      addLog("ERROR", "Camera not ready yet. Tap Initialize Optics and wait 1–2 seconds.", "error");
+      addLog("ERROR", "Camera not ready yet. Wait 1–2 seconds after Initialize Optics.", "error");
       setAnalyzing(false);
+      inFlightRef.current = false;
       return;
     }
 
@@ -408,7 +494,7 @@ export default function App() {
 You are OmniTech, an autonomous field agent responsible for human safety and system diagnosis.
 
 CORE PROTOCOLS:
-1. REFUSAL AUTHORITY: If a hazard is present (water, live wires, fire), you MUST refuse repair instructions. Say: "For your safety, I cannot proceed until [hazard] is resolved."
+1. REFUSAL AUTHORITY: If a hazard is present (water, live wires, fire), you MUST refuse repair instructions.
 2. EPISTEMIC HUMILITY: If image is blurry/dark/obstructed, return status "UNCERTAIN". Do not guess.
 
 OUTPUT FORMAT (JSON ONLY):
@@ -453,11 +539,34 @@ OUTPUT FORMAT (JSON ONLY):
         }),
       });
 
-      // Better error visibility
+      // If quota/rate limit hit — switch to demo so recording still looks alive
+      if (response.status === 429) {
+        const errText = await response.text().catch(() => "");
+        addLog("ERROR", `Gemini HTTP 429 (quota/rate limit). Switching to demo output.`, "error");
+        addLog("SYSTEM", `Tip: reduce clicks / disable report / or increase quota in Google billing.`, "info");
+
+        if (DEMO_MODE) {
+          const demo = getDemoResult(mode, demoStep);
+          setDemoStep((s) => s + 1);
+          handleAnalysisResult(demo, mode, { skipSave: true });
+          setToast({ message: "Quota hit — demo fallback enabled.", type: "success" });
+          setAnalyzing(false);
+          inFlightRef.current = false;
+          return;
+        }
+
+        // If not demo mode, still show readable error
+        addLog("ERROR", `Gemini HTTP 429 details: ${errText.slice(0, 160)}`, "error");
+        setAnalyzing(false);
+        inFlightRef.current = false;
+        return;
+      }
+
       if (!response.ok) {
         const errText = await response.text();
         addLog("ERROR", `Gemini HTTP ${response.status}: ${errText.slice(0, 180)}`, "error");
         setAnalyzing(false);
+        inFlightRef.current = false;
         return;
       }
 
@@ -466,18 +575,18 @@ OUTPUT FORMAT (JSON ONLY):
       if (data?.error) {
         addLog("ERROR", `Gemini error: ${data.error.message || "Unknown error"}`, "error");
         setAnalyzing(false);
+        inFlightRef.current = false;
         return;
       }
 
       const resultText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-
       if (!resultText) {
         addLog("ERROR", "No response from AI. Try again.", "error");
         setAnalyzing(false);
+        inFlightRef.current = false;
         return;
       }
 
-      // Robust parse (strip code fences)
       const cleanText = String(resultText).replace(/```json\s*|```/g, "").trim();
 
       let result;
@@ -487,6 +596,7 @@ OUTPUT FORMAT (JSON ONLY):
         console.error("JSON Parse Error:", parseErr, "Raw:", resultText);
         addLog("ERROR", "AI response corrupted (bad JSON). Try again.", "error");
         setAnalyzing(false);
+        inFlightRef.current = false;
         return;
       }
 
@@ -497,10 +607,11 @@ OUTPUT FORMAT (JSON ONLY):
       addLog("ERROR", "Connection to OmniTech Core failed. Check network.", "error");
     } finally {
       setAnalyzing(false);
+      inFlightRef.current = false;
     }
   };
 
-  const handleAnalysisResult = (result, mode) => {
+  const handleAnalysisResult = (result, mode, opts = {}) => {
     if (mode === "repair_guide" && result?.repair_steps) {
       setRepairSteps(result.repair_steps);
       setShowRepairModal(true);
@@ -510,13 +621,10 @@ OUTPUT FORMAT (JSON ONLY):
     setCurrentAnalysis(result);
     setSystemState(result?.status || "UNCERTAIN");
 
-    // Speak headline + action
     speak(`${result?.headline || "Update"}. ${result?.action_required || ""}`);
-
     addLog("OMNITECH", result?.reasoning || "No reasoning returned.");
 
-    // Save to Firestore if available
-    if (user && db) {
+    if (!opts.skipSave && user && db) {
       try {
         addDoc(collection(db, "artifacts", appId, "users", user.uid, "safety_events"), {
           timestamp: serverTimestamp(),
@@ -530,17 +638,36 @@ OUTPUT FORMAT (JSON ONLY):
   };
 
   /* -------------------------
-    REPORT GENERATION (optional)
+    REPORT GENERATION
   ------------------------- */
   const generateFieldReport = async () => {
     if (logs.length === 0) return;
-    if (!API_KEY) {
-      addLog("ERROR", "Missing VITE_GEMINI_API_KEY. Cannot generate report.", "error");
+
+    // If API is missing or demo mode, generate local report (no tokens)
+    if (!API_KEY || DEMO_MODE) {
+      const local = [
+        "FIELD INCIDENT REPORT",
+        "--------------------",
+        `Generated: ${new Date().toLocaleString()}`,
+        "",
+        "SESSION LOGS:",
+        ...logs
+          .slice(0, 30)
+          .reverse()
+          .map((l) => `[${l.time}] ${l.source}: ${l.message}`),
+        "",
+        "Summary:",
+        "- OmniTech recorded safety/diagnostic events.",
+        "- Review recommended actions before proceeding.",
+      ].join("\n");
+
+      setGeneratedReport(local);
+      setShowReportModal(true);
+      addLog("SYSTEM", "Local report generated (demo / no-quota mode).");
       return;
     }
 
     setGeneratingReport(true);
-
     const logText = logs.map((l) => `[${l.time}] ${l.source}: ${l.message}`).join("\n");
 
     try {
@@ -551,11 +678,7 @@ OUTPUT FORMAT (JSON ONLY):
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [
-            {
-              parts: [
-                { text: `Generate a professional Field Incident Report based on these raw logs:\n\n${logText}` },
-              ],
-            },
+            { parts: [{ text: `Generate a professional Field Incident Report based on these raw logs:\n\n${logText}` }] },
           ],
           generationConfig: { maxOutputTokens: 500, temperature: 0.7 },
           systemInstruction: {
@@ -563,6 +686,26 @@ OUTPUT FORMAT (JSON ONLY):
           },
         }),
       });
+
+      if (response.status === 429) {
+        addLog("ERROR", "Report HTTP 429 (quota). Using local report instead.", "error");
+        const local = [
+          "FIELD INCIDENT REPORT (LOCAL FALLBACK)",
+          "-------------------------------------",
+          `Generated: ${new Date().toLocaleString()}`,
+          "",
+          "SESSION LOGS:",
+          ...logs
+            .slice(0, 30)
+            .reverse()
+            .map((l) => `[${l.time}] ${l.source}: ${l.message}`),
+        ].join("\n");
+
+        setGeneratedReport(local);
+        setShowReportModal(true);
+        setGeneratingReport(false);
+        return;
+      }
 
       if (!response.ok) {
         const errText = await response.text();
@@ -621,7 +764,6 @@ OUTPUT FORMAT (JSON ONLY):
   const submitTextDiagnosis = () => {
     const clean = userContext.trim();
     if (!clean) return;
-
     setToast({ message: "Context sent.", type: "success" });
     callOmniTech("diagnosis", clean);
     setUserContext("");
@@ -630,12 +772,9 @@ OUTPUT FORMAT (JSON ONLY):
   /* =========================
     RENDER
 ========================= */
-
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 font-sans overflow-hidden flex flex-col relative selection:bg-cyan-500/30">
-      {toast && (
-        <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />
-      )}
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
 
       {/* Background */}
       <div className="fixed inset-0 z-0 pointer-events-none overflow-hidden">
@@ -658,9 +797,7 @@ OUTPUT FORMAT (JSON ONLY):
       </div>
 
       {/* HUD */}
-      <div
-        className={`absolute inset-0 pointer-events-none border-[12px] transition-all duration-500 z-20 ${getStatusColor()} opacity-80`}
-      />
+      <div className={`absolute inset-0 pointer-events-none border-[12px] transition-all duration-500 z-20 ${getStatusColor()} opacity-80`} />
 
       {/* Header */}
       <div className="absolute top-0 left-0 right-0 z-30 p-4 flex justify-between items-start bg-gradient-to-b from-black/80 to-transparent">
@@ -669,7 +806,7 @@ OUTPUT FORMAT (JSON ONLY):
             <Activity className="w-6 h-6 animate-pulse" /> OMNI<span className="text-white">TECH</span>
           </h1>
           <p className="text-xs text-slate-400 font-mono mt-1">
-            UNIT: {user ? user.uid.slice(0, 6) : "OFFLINE"} // V.3.3.1
+            UNIT: {user ? user.uid.slice(0, 6) : "OFFLINE"} // V.3.3.2
           </p>
         </div>
 
@@ -689,10 +826,7 @@ OUTPUT FORMAT (JSON ONLY):
       </div>
 
       {/* Main Viewport */}
-      <div
-        className="flex-1 relative bg-black flex items-center justify-center overflow-hidden z-10"
-        onClick={handleTapToFocus}
-      >
+      <div className="flex-1 relative bg-black flex items-center justify-center overflow-hidden z-10" onClick={handleTapToFocus}>
         {!isStreamActive && (
           <div className="absolute inset-0 flex flex-col items-center justify-center z-10 bg-slate-900/80 backdrop-blur-sm">
             <div className="relative">
@@ -700,9 +834,7 @@ OUTPUT FORMAT (JSON ONLY):
                 <Camera className="w-6 h-6" /> Initialize Optics
               </button>
             </div>
-            <p className="mt-4 text-slate-500 font-mono text-sm">
-              Waiting for visual input...
-            </p>
+            <p className="mt-4 text-slate-500 font-mono text-sm">Waiting for visual input...</p>
           </div>
         )}
 
@@ -711,9 +843,7 @@ OUTPUT FORMAT (JSON ONLY):
           autoPlay
           playsInline
           muted
-          className={`w-full h-full object-cover transition-opacity duration-700 ${
-            isStreamActive ? "opacity-100" : "opacity-20"
-          }`}
+          className={`w-full h-full object-cover transition-opacity duration-700 ${isStreamActive ? "opacity-100" : "opacity-20"}`}
         />
         <canvas ref={canvasRef} className="hidden" />
 
@@ -737,9 +867,7 @@ OUTPUT FORMAT (JSON ONLY):
               {currentAnalysis.status === "UNCERTAIN" && <ScanEye className="w-5 h-5 text-amber-500" />}
             </div>
 
-            <h3 className="text-lg font-bold text-white mb-1 leading-tight">
-              {currentAnalysis.headline}
-            </h3>
+            <h3 className="text-lg font-bold text-white mb-1 leading-tight">{currentAnalysis.headline}</h3>
             <p className="text-sm text-slate-300 mb-3">{currentAnalysis.reasoning}</p>
 
             <div
@@ -751,9 +879,7 @@ OUTPUT FORMAT (JSON ONLY):
                   : "bg-cyan-900/30 border-cyan-500"
               }`}
             >
-              <span className="block text-xs font-bold uppercase opacity-70 mb-1">
-                Recommended Action
-              </span>
+              <span className="block text-xs font-bold uppercase opacity-70 mb-1">Recommended Action</span>
               <p className="text-sm font-medium text-white">{currentAnalysis.action_required}</p>
             </div>
 
@@ -788,11 +914,7 @@ OUTPUT FORMAT (JSON ONLY):
                 disabled={logs.length < 2 || generatingReport}
                 className="text-xs bg-slate-800 hover:bg-slate-700 text-cyan-400 px-2 py-1 rounded flex items-center gap-1 transition-colors disabled:opacity-50"
               >
-                {generatingReport ? (
-                  <Activity className="w-3 h-3 animate-spin" />
-                ) : (
-                  <FileText className="w-3 h-3" />
-                )}{" "}
+                {generatingReport ? <Activity className="w-3 h-3 animate-spin" /> : <FileText className="w-3 h-3" />}{" "}
                 Report
               </button>
             </div>
@@ -848,11 +970,7 @@ OUTPUT FORMAT (JSON ONLY):
                     : "text-slate-400 hover:text-slate-200"
                 }`}
               >
-                {systemState === "DANGER" ? (
-                  <ShieldAlert className="w-5 h-5 text-red-400" />
-                ) : (
-                  <Zap className="w-5 h-5" />
-                )}
+                {systemState === "DANGER" ? <ShieldAlert className="w-5 h-5 text-red-400" /> : <Zap className="w-5 h-5" />}
                 DIAGNOSE
               </button>
             </div>
@@ -881,11 +999,7 @@ OUTPUT FORMAT (JSON ONLY):
                 }`}
                 aria-label="Voice input"
               >
-                {isListening ? (
-                  <Loader2 className="w-5 h-5 animate-spin" />
-                ) : (
-                  <Mic className="w-5 h-5" />
-                )}
+                {isListening ? <Loader2 className="w-5 h-5 animate-spin" /> : <Mic className="w-5 h-5" />}
               </button>
             </div>
           </div>
